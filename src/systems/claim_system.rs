@@ -1,16 +1,30 @@
 use std::{sync::Arc, time::Duration};
 
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
-use solana_sdk::{compute_budget::ComputeBudgetInstruction, native_token::lamports_to_sol, signature::{Keypair, Signature}, signer::Signer, transaction::Transaction};
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    native_token::lamports_to_sol,
+    signature::{Keypair, Signature},
+    signer::Signer,
+    transaction::Transaction,
+};
 use solana_transaction_status::TransactionConfirmationStatus;
 use spl_associated_token_account::get_associated_token_address;
 use tokio::time::Instant;
 use tracing::{error, info};
 
-use crate::{app_database::AppDatabase, ore_utils::{get_ore_mint, ORE_TOKEN_DECIMALS}, ClaimsQueue, InsertClaim, InsertTxn};
+use crate::{
+    app_database::AppDatabase,
+    ore_utils::{get_ore_mint, ORE_TOKEN_DECIMALS},
+    ClaimsQueue, InsertClaim, InsertTxn,
+};
 
-
-pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcClient>, wallet: Arc<Keypair>, app_database: Arc<AppDatabase>) {
+pub async fn claim_system(
+    claims_queue: Arc<ClaimsQueue>,
+    rpc_client: Arc<RpcClient>,
+    wallet: Arc<Keypair>,
+    app_database: Arc<AppDatabase>,
+) {
     loop {
         let mut claim = None;
         let reader = claims_queue.queue.read().await;
@@ -71,19 +85,26 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
 
                 tx.sign(&[&wallet], hash);
 
-                let rpc_config =  RpcSendTransactionConfig {
+                let rpc_config = RpcSendTransactionConfig {
                     preflight_commitment: Some(rpc_client.commitment().commitment),
                     ..RpcSendTransactionConfig::default()
                 };
 
                 let signature;
                 loop {
-                    if let Ok(sig) = rpc_client.send_transaction_with_config(&tx, rpc_config).await {
-                        signature = sig;
-                        break;
-                    } else {
-                        error!("Failed to send claim transaction. retrying in 2 seconds...");
-                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                    match rpc_client
+                        .send_transaction_with_config(&tx, rpc_config)
+                        .await
+                    {
+                        Ok(sig) => {
+                            signature = sig;
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Failed to send claim transaction. retrying in 2 seconds...");
+                            error!("ERROR! {:?}", e);
+                            tokio::time::sleep(Duration::from_millis(2000)).await;
+                        }
                     }
                 }
 
@@ -95,7 +116,9 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
                     if let Ok(response) = results {
                         let statuses = response.value;
                         if let Some(status) = &statuses[0] {
-                            if status.confirmation_status() == TransactionConfirmationStatus::Confirmed {
+                            if status.confirmation_status()
+                                == TransactionConfirmationStatus::Confirmed
+                            {
                                 if status.err.is_some() {
                                     let e_str = format!("Transaction Failed: {:?}", status.err);
                                     break Err(e_str);
@@ -110,7 +133,12 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
                 match result {
                     Ok(sig) => {
                         let amount_dec = amount as f64 / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
-                        info!("Miner {} successfully claimed {}.\nSig: {}", user_pubkey.to_string(), amount_dec, sig.to_string());
+                        info!(
+                            "Miner {} successfully claimed {}.\nSig: {}",
+                            user_pubkey.to_string(),
+                            amount_dec,
+                            sig.to_string()
+                        );
 
                         // TODO: use transacions, or at least put them into one query
                         let miner = app_database
@@ -121,9 +149,8 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
                             .get_pool_by_authority_pubkey(wallet.pubkey().to_string())
                             .await
                             .unwrap();
-                        while let Err(_) = app_database
-                            .decrease_miner_reward(miner.id, amount)
-                            .await 
+                        while let Err(_) =
+                            app_database.decrease_miner_reward(miner.id, amount).await
                         {
                             error!("Failed to decrease miner rewards! Retrying...");
                             tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -157,7 +184,6 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
                             }
                         }
 
-
                         let iclaim = InsertClaim {
                             miner_id: miner.id,
                             pool_id: db_pool.id,
@@ -174,7 +200,6 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
                         drop(writer);
 
                         info!("Claim successfully processed!");
-
                     }
                     Err(e) => {
                         error!("ERROR: {:?}", e);
@@ -183,7 +208,6 @@ pub async fn claim_system(claims_queue: Arc<ClaimsQueue>, rpc_client: Arc<RpcCli
             } else {
                 error!("Failed to confirm transaction, will retry on next iteration.");
             }
-
         }
 
         tokio::time::sleep(Duration::from_secs(10)).await;

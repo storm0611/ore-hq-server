@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     ops::{ControlFlow, Div, Range},
     path::Path,
+    str::from_utf8,
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -15,14 +16,18 @@ use systems::claim_system::claim_system;
 use crate::ore_utils::{get_managed_proof_token_ata, get_proof_pda};
 
 use self::models::*;
-use app_rr_database::AppRRDatabase;
 use ::ore_utils::AccountDeserialize;
 use app_database::{AppDatabase, AppDatabaseError};
+use app_rr_database::AppRRDatabase;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         ConnectInfo, Query, State, WebSocketUpgrade,
-    }, http::{Method, Response, StatusCode}, response::IntoResponse, routing::{get, post}, Extension, Json, Router
+    },
+    http::{Method, Response, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Extension, Json, Router,
 };
 use axum_extra::{headers::authorization::Basic, TypedHeader};
 use base64::{prelude::BASE64_STANDARD, Engine};
@@ -31,38 +36,58 @@ use drillx::Solution;
 use futures::{stream::SplitSink, SinkExt, StreamExt};
 use ore_api::{consts::BUS_COUNT, event::MineEvent, state::Proof};
 use ore_utils::{
-    get_auth_ix, get_config, get_cutoff, get_delegated_stake_account, get_mine_ix, get_ore_mint, get_original_proof, get_proof, get_proof_and_config_with_busses, get_register_ix, get_reset_ix, ORE_TOKEN_DECIMALS
+    get_auth_ix, get_config, get_cutoff, get_delegated_stake_account, get_mine_ix, get_ore_mint,
+    get_original_proof, get_proof, get_proof_and_config_with_busses, get_register_ix, get_reset_ix,
+    ORE_TOKEN_DECIMALS,
 };
 use rand::Rng;
 use routes::{get_challenges, get_latest_mine_txn, get_pool_balance};
 use serde::Deserialize;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
-    nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient}, rpc_client::SerializableTransaction, rpc_config::{RpcAccountInfoConfig, RpcSendTransactionConfig, RpcSimulateTransactionConfig, RpcTransactionConfig}
+    nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
+    rpc_client::SerializableTransaction,
+    rpc_config::{
+        RpcAccountInfoConfig, RpcSendTransactionConfig, RpcSimulateTransactionConfig,
+        RpcTransactionConfig,
+    },
 };
 use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel}, compute_budget::ComputeBudgetInstruction, instruction::InstructionError, native_token::{lamports_to_sol, LAMPORTS_PER_SOL}, pubkey::Pubkey, signature::{read_keypair_file, Keypair, Signature}, signer::Signer, system_instruction::{self, transfer}, transaction::{Transaction, TransactionError}
+    commitment_config::{CommitmentConfig, CommitmentLevel},
+    compute_budget::ComputeBudgetInstruction,
+    instruction::InstructionError,
+    native_token::{lamports_to_sol, LAMPORTS_PER_SOL},
+    pubkey::Pubkey,
+    signature::{read_keypair_file, Keypair, Signature},
+    signer::Signer,
+    system_instruction::{self, transfer},
+    transaction::{Transaction, TransactionError},
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
-use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account};
+use spl_associated_token_account::{
+    get_associated_token_address, instruction::create_associated_token_account,
+};
 use tokio::{
     io::AsyncReadExt,
     sync::{
         mpsc::{UnboundedReceiver, UnboundedSender},
         Mutex, RwLock,
-    }, time::Instant,
+    },
+    time::Instant,
 };
-use tower_http::{cors::CorsLayer, trace::{DefaultMakeSpan, TraceLayer}};
+use tower_http::{
+    cors::CorsLayer,
+    trace::{DefaultMakeSpan, TraceLayer},
+};
 use tracing::{error, info};
 
-mod app_rr_database;
 mod app_database;
+mod app_rr_database;
 mod models;
+mod proof_migration;
 mod routes;
 mod schema;
 mod systems;
-mod proof_migration;
-
 
 const MIN_DIFF: u32 = 8;
 const MIN_HASHPOWER: u64 = 5;
@@ -90,7 +115,7 @@ struct ClaimsQueue {
 }
 
 struct SubmissionWindow {
-    closed: bool
+    closed: bool,
 }
 
 pub struct MessageInternalAllClients {
@@ -107,7 +132,7 @@ pub struct MessageInternalMineSuccess {
 }
 
 pub struct LastPong {
-    pongs: HashMap<SocketAddr, Instant>
+    pongs: HashMap<SocketAddr, Instant>,
 }
 
 #[derive(Debug)]
@@ -172,13 +197,29 @@ struct Args {
         global = true
     )]
     signup_cost: u64,
-    #[arg(
-        long,
-        short,
-        action,
-        help = "Enable stats endpoints",
-    )]
+    #[arg(long, short, action, help = "Enable stats endpoints")]
     stats: bool,
+}
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref KEYPAIR: Keypair = {
+        dotenv::dotenv().ok();
+        let wallet_path_str = std::env::var("MINE_WALLET_PATH").expect("MINE_WALLET_PATH must be set.");
+        let wallet_path = Path::new(&wallet_path_str);
+
+        if !wallet_path.exists() {
+            tracing::error!("Failed to load wallet at: {}", wallet_path_str);
+            panic!("Failed to find wallet path.");
+        }
+
+        let keypair = read_keypair_file(wallet_path)
+                .expect("Failed to load keypair from file: {wallet_path_str}");
+        info!("loaded mine wallet {}", keypair.pubkey().to_string());
+
+        keypair
+    };
 }
 
 #[tokio::main]
@@ -192,7 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // load envs
     let wallet_path_str = std::env::var("WALLET_PATH").expect("WALLET_PATH must be set.");
-    let fee_wallet_path_str = std::env::var("FEE_WALLET_PATH").expect("FEE_WALLET_PATH must be set.");
+    let fee_wallet_path_str =
+        std::env::var("FEE_WALLET_PATH").expect("FEE_WALLET_PATH must be set.");
     let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set.");
     let rpc_ws_url = std::env::var("RPC_WS_URL").expect("RPC_WS_URL must be set.");
     let password = std::env::var("PASSWORD").expect("PASSWORD must be set.");
@@ -248,8 +290,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Failed to find wallet path.".into());
     }
 
-    let wallet = read_keypair_file(wallet_path)
-        .expect("Failed to load keypair from file: {wallet_path_str}");
+    let wallet = Arc::new(
+        read_keypair_file(wallet_path)
+            .expect("Failed to load keypair from file: {wallet_path_str}"),
+    );
     info!("loaded wallet {}", wallet.pubkey().to_string());
 
     let wallet_path = Path::new(&fee_wallet_path_str);
@@ -259,8 +303,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Failed to find fee wallet path.".into());
     }
 
-    let fee_wallet = read_keypair_file(wallet_path)
-        .expect("Failed to load keypair from file: {wallet_path_str}");
+    let fee_wallet = Arc::new(
+        read_keypair_file(wallet_path)
+            .expect("Failed to load keypair from file: {wallet_path_str}"),
+    );
     info!("loaded fee wallet {}", wallet.pubkey().to_string());
 
     info!("establishing rpc connection...");
@@ -324,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(data) => {
             info!("Miner Delegated Stake Account: {:?}", data);
             info!("Miner delegate stake account already created.");
-        },
+        }
         Err(_) => {
             info!("Creating miner delegate stake account");
             let ix = ore_miner_delegation::instruction::init_delegate_stake(
@@ -342,12 +388,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             tx.sign(&[&wallet], blockhash);
 
-            match rpc_client.send_and_confirm_transaction_with_spinner_and_commitment(&tx, CommitmentConfig {
-                commitment: CommitmentLevel::Confirmed
-            }).await {
+            match rpc_client
+                .send_and_confirm_transaction_with_spinner_and_commitment(
+                    &tx,
+                    CommitmentConfig {
+                        commitment: CommitmentLevel::Confirmed,
+                    },
+                )
+                .await
+            {
                 Ok(_) => {
                     info!("Successfully created miner delegate stake account");
-                },
+                }
                 Err(_) => {
                     error!("Failed to send and confirm tx.");
                     panic!("Failed to create miner delegate stake account");
@@ -357,16 +409,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("Validating managed proof token account is created");
-    let managed_proof = Pubkey::find_program_address(&[b"managed-proof-account", wallet.pubkey().as_ref()], &ore_miner_delegation::id());
+    let managed_proof = Pubkey::find_program_address(
+        &[b"managed-proof-account", wallet.pubkey().as_ref()],
+        &ore_miner_delegation::id(),
+    );
 
     let managed_proof_token_account_addr = get_managed_proof_token_ata(wallet.pubkey());
-    match rpc_client.get_token_account_balance(&managed_proof_token_account_addr).await {
+    match rpc_client
+        .get_token_account_balance(&managed_proof_token_account_addr)
+        .await
+    {
         Ok(_) => {
             info!("Managed proof token account already created.");
-        },
+        }
         Err(_) => {
             info!("Creating managed proof token account");
-            let ix = create_associated_token_account(&wallet.pubkey(), &managed_proof.0, &ore_api::consts::MINT_ADDRESS, &spl_token::id());
+            let ix = create_associated_token_account(
+                &wallet.pubkey(),
+                &managed_proof.0,
+                &ore_api::consts::MINT_ADDRESS,
+                &spl_token::id(),
+            );
 
             let mut tx = Transaction::new_with_payer(&[ix], Some(&wallet.pubkey()));
 
@@ -377,12 +440,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             tx.sign(&[&wallet], blockhash);
 
-            match rpc_client.send_and_confirm_transaction_with_spinner_and_commitment(&tx, CommitmentConfig {
-                commitment: CommitmentLevel::Confirmed
-            }).await {
+            match rpc_client
+                .send_and_confirm_transaction_with_spinner_and_commitment(
+                    &tx,
+                    CommitmentConfig {
+                        commitment: CommitmentLevel::Confirmed,
+                    },
+                )
+                .await
+            {
                 Ok(_) => {
                     info!("Successfully created managed proof token account");
-                },
+                }
                 Err(e) => {
                     error!("Failed to send and confirm tx.\nE: {:?}", e);
                     panic!("Failed to create managed proof token account");
@@ -391,8 +460,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let miner_ore_token_account_addr = get_associated_token_address(&wallet.pubkey(), &ore_api::consts::MINT_ADDRESS);
-    let token_balance = if let Ok(token_balance) = rpc_client.get_token_account_balance(&miner_ore_token_account_addr).await {
+    info!("ore mint address: {}", &ore_api::consts::MINT_ADDRESS);
+
+    let miner_ore_token_account_addr =
+        get_associated_token_address(&wallet.pubkey(), &ore_api::consts::MINT_ADDRESS);
+    let token_balance = if let Ok(token_balance) = rpc_client
+        .get_token_account_balance(&miner_ore_token_account_addr)
+        .await
+    {
         let bal = token_balance.ui_amount.unwrap() * 10f64.powf(token_balance.decimals as f64);
         bal as u64
     } else {
@@ -401,14 +476,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("Checking original proof, and token account balances.");
-    let original_proof = if let Ok(loaded_proof) = get_original_proof(&rpc_client, wallet.pubkey()).await {
-        loaded_proof
-    } else {
-    panic!("Failed to get original proof!");
-    };
+    let original_proof =
+        if let Ok(loaded_proof) = get_original_proof(&rpc_client, wallet.pubkey()).await {
+            loaded_proof
+        } else {
+            panic!("Failed to get original proof!");
+        };
     if original_proof.balance > 0 || token_balance > 0 {
-        info!("Proof balance has {} tokens. Miner ORE token account has {} tokens.\nMigrating...", original_proof.balance, token_balance);
-        if let Err(e) = proof_migration::migrate(&rpc_client, &wallet, original_proof.balance, token_balance).await {
+        info!(
+            "Proof balance has {} tokens. Miner ORE token account has {} tokens.\nMigrating...",
+            original_proof.balance, token_balance
+        );
+        if let Err(e) =
+            proof_migration::migrate(&rpc_client, &wallet, original_proof.balance, token_balance)
+                .await
+        {
             info!("Failed to migrate proof balance.\nError: {}", e);
             panic!("Failed to migrate proof balance.");
         } else {
@@ -430,7 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Pool missing from database. Inserting...");
             let proof_pubkey = get_proof_pda(wallet.pubkey());
             let result = app_database
-                .add_new_pool(wallet.pubkey().to_string(), proof_pubkey.to_string())
+                .add_new_pool(wallet.clone(), proof_pubkey.to_string(), fee_wallet.clone())
                 .await;
 
             if result.is_err() {
@@ -485,8 +567,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     let wallet_extension = Arc::new(WalletExtension {
-        miner_wallet: Arc::new(wallet),
-        fee_wallet: Arc::new(fee_wallet),
+        miner_wallet: wallet.clone(),
+        fee_wallet: fee_wallet.clone(),
     });
     let proof_ext = Arc::new(Mutex::new(proof));
     let nonce_ext = Arc::new(Mutex::new(0u64));
@@ -499,10 +581,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     let ready_clients = Arc::new(Mutex::new(HashSet::new()));
 
-    let pongs = Arc::new(RwLock::new(LastPong { pongs: HashMap::new() }));
+    let pongs = Arc::new(RwLock::new(LastPong {
+        pongs: HashMap::new(),
+    }));
 
     let claims_queue = Arc::new(ClaimsQueue {
-        queue: RwLock::new(HashMap::new())
+        queue: RwLock::new(HashMap::new()),
     });
 
     let submission_window = Arc::new(RwLock::new(SubmissionWindow { closed: false }));
@@ -515,7 +599,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_claims_queue = claims_queue.clone();
     let app_app_database = app_database.clone();
     tokio::spawn(async move {
-        claim_system(app_claims_queue, app_rpc_client, app_wallet.miner_wallet.clone(), app_app_database).await;
+        claim_system(
+            app_claims_queue,
+            app_rpc_client,
+            app_wallet.miner_wallet.clone(),
+            app_app_database,
+        )
+        .await;
     });
 
     // Track client pong timings
@@ -556,7 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app_config,
             app_state,
             app_pongs,
-            app_submission_window
+            app_submission_window,
         )
         .await;
     });
@@ -570,7 +660,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_state = shared_state.clone();
     tokio::spawn(async move {
         loop {
-
             let reader = app_state.read().await;
             let paused = reader.paused.clone();
             drop(reader);
@@ -608,8 +697,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         drop(lock);
                         let challenge = latest_proof.challenge;
 
-
-                        info!("Giving clients challenge: {}", BASE64_STANDARD.encode(challenge));
+                        info!(
+                            "Giving clients challenge: {}",
+                            BASE64_STANDARD.encode(challenge)
+                        );
                         for client in clients {
                             let nonce_range = {
                                 let mut nonce = app_nonce.lock().await;
@@ -654,7 +745,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-
             } else {
                 info!("Mining is paused");
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -722,7 +812,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Starting mine submission attempt {} with difficulty {}.",
                                 i, difficulty
                             );
-                            info!("Submission Challenge: {}", BASE64_STANDARD.encode(old_proof.challenge));
+                            info!(
+                                "Submission Challenge: {}",
+                                BASE64_STANDARD.encode(old_proof.challenge)
+                            );
                             let mut loaded_config = None;
                             info!("Getting latest config and busses data.");
                             if let (Ok(p), Ok(config), Ok(_busses)) =
@@ -775,30 +868,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             let jito_tip = *app_jito_tip;
                             if jito_tip > 0 {
-                                        let tip_accounts = [
-                                            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-                                            "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-                                            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-                                            "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-                                            "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-                                            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-                                            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-                                            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-                                        ];
-                                        ixs.push(transfer(
-                                            &signer.pubkey(),
-                                            &Pubkey::from_str(
-                                                &tip_accounts
-                                                    .choose(&mut rand::thread_rng())
-                                                    .unwrap()
-                                                    .to_string(),
-                                            )
-                                            .unwrap(),
-                                            jito_tip,
-                                        ));
+                                let tip_accounts = [
+                                    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+                                    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+                                    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+                                    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+                                    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+                                    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+                                    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+                                    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+                                ];
+                                ixs.push(transfer(
+                                    &signer.pubkey(),
+                                    &Pubkey::from_str(
+                                        &tip_accounts
+                                            .choose(&mut rand::thread_rng())
+                                            .unwrap()
+                                            .to_string(),
+                                    )
+                                    .unwrap(),
+                                    jito_tip,
+                                ));
 
-                                        info!("Jito tip: {} SOL", lamports_to_sol(jito_tip));
-                                    }
+                                info!("Jito tip: {} SOL", lamports_to_sol(jito_tip));
+                            }
 
                             let noop_ix = get_auth_ix(signer.pubkey());
                             ixs.push(noop_ix);
@@ -807,7 +900,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let reset_ix = get_reset_ix(signer.pubkey());
                                 ixs.push(reset_ix);
                             }
-
 
                             let ix_mine = get_mine_ix(signer.pubkey(), best_solution, bus);
                             ixs.push(ix_mine);
@@ -829,24 +921,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     rpc_client.clone()
                                 };
 
-                                let rpc_config =  RpcSendTransactionConfig {
+                                let rpc_config = RpcSendTransactionConfig {
                                     skip_preflight: false,
                                     preflight_commitment: Some(rpc_client.commitment().commitment),
                                     ..RpcSendTransactionConfig::default()
                                 };
 
-                                let rpc_sim_config =  RpcSimulateTransactionConfig {
+                                let rpc_sim_config = RpcSimulateTransactionConfig {
                                     sig_verify: false,
                                     ..RpcSimulateTransactionConfig::default()
                                 };
 
-
                                 let sim_tx = tx.clone();
 
-                                if let Ok(result) = rpc_client.simulate_transaction_with_config(&sim_tx, rpc_sim_config).await {
+                                if let Ok(result) = rpc_client
+                                    .simulate_transaction_with_config(&sim_tx, rpc_sim_config)
+                                    .await
+                                {
                                     if let Some(tx_error) = result.value.err {
-                                        if tx_error == TransactionError::InstructionError(4, InstructionError::Custom(1))
-                                        || tx_error == TransactionError::InstructionError(5, InstructionError::Custom(1)) {
+                                        if tx_error
+                                            == TransactionError::InstructionError(
+                                                4,
+                                                InstructionError::Custom(1),
+                                            )
+                                            || tx_error
+                                                == TransactionError::InstructionError(
+                                                    5,
+                                                    InstructionError::Custom(1),
+                                                )
+                                        {
                                             error!("Custom program error: Invalid Hash");
                                             break;
                                         }
@@ -855,18 +958,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 let mut rpc_send_attempts = 1;
                                 let signature = loop {
-                                    match send_client.send_transaction_with_config(&tx, rpc_config).await {
+                                    match send_client
+                                        .send_transaction_with_config(&tx, rpc_config)
+                                        .await
+                                    {
                                         Ok(sig) => {
                                             break Ok(sig);
-                                        
-                                        },
+                                        }
                                         Err(_e) => {
                                             error!("Attempt {} Failed to send mine transaction. retrying in 1 seconds...", rpc_send_attempts);
                                             rpc_send_attempts += 1;
 
                                             if rpc_send_attempts >= 5 {
                                                 break Err("Failed to send tx");
-
                                             }
                                             tokio::time::sleep(Duration::from_millis(1500)).await;
                                         }
@@ -888,29 +992,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             break;
                                         } else {
                                             info!("Resending signed tx...");
-                                            let _ = send_client.send_transaction_with_config(&tx, rpc_config).await;
+                                            let _ = send_client
+                                                .send_transaction_with_config(&tx, rpc_config)
+                                                .await;
                                         }
                                         tokio::time::sleep(Duration::from_millis(2000)).await;
                                     }
-                                    return
-
+                                    return;
                                 });
 
                                 let result: Result<Signature, String> = loop {
                                     if expired_timer.elapsed().as_secs() >= 200 {
                                         break Err("Transaction Expired".to_string());
                                     }
-                                    let results = rpc_client.get_signature_statuses(&[signature]).await;
+                                    let results =
+                                        rpc_client.get_signature_statuses(&[signature]).await;
                                     if let Ok(response) = results {
                                         let statuses = response.value;
                                         if let Some(status) = &statuses[0] {
                                             info!("Status: {:?}", status);
-                                            if status.confirmation_status() == TransactionConfirmationStatus::Finalized {
-                                                    if status.err.is_some() {
-                                                        let e_str = format!("Transaction Failed: {:?}", status.err);
-                                                        break Err(e_str);
-                                                    }
-                                                    break Ok(signature);
+                                            if status.confirmation_status()
+                                                == TransactionConfirmationStatus::Finalized
+                                            {
+                                                if status.err.is_some() {
+                                                    let e_str = format!(
+                                                        "Transaction Failed: {:?}",
+                                                        status.err
+                                                    );
+                                                    break Err(e_str);
+                                                }
+                                                break Ok(signature);
                                             }
                                         }
                                     }
@@ -933,9 +1044,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         };
                                         let app_db = app_database.clone();
                                         tokio::spawn(async move {
-                                            while let Err(_) = app_db.add_new_txn(itxn.clone()).await {
+                                            while let Err(_) =
+                                                app_db.add_new_txn(itxn.clone()).await
+                                            {
                                                 error!("Failed to add tx to db! Retrying...");
-                                                tokio::time::sleep(Duration::from_millis(2000)).await;
+                                                tokio::time::sleep(Duration::from_millis(2000))
+                                                    .await;
                                             }
                                         });
 
@@ -943,7 +1057,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // and clients
                                         let app_rpc_client = rpc_client.clone();
                                         let app_app_database = app_database.clone();
-                                        let app_mine_success_sender = Arc::new(mine_success_sender.clone());
+                                        let app_mine_success_sender =
+                                            Arc::new(mine_success_sender.clone());
                                         let app_app_wallet = app_wallet.clone();
                                         let app_app_proof = app_proof.clone();
                                         tokio::spawn(async move {
@@ -953,12 +1068,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let app_wallet = app_app_wallet;
                                             let app_proof = app_app_proof;
                                             loop {
-                                                if let Ok(txn_result) = rpc_client.get_transaction_with_config(&sig, RpcTransactionConfig {
-                                                    encoding: Some(UiTransactionEncoding::Base64),
-                                                    commitment: Some(rpc_client.commitment()),
-                                                    max_supported_transaction_version: None,
-                                                }).await {
-                                                    let data = txn_result.transaction.meta.unwrap().return_data;
+                                                if let Ok(txn_result) = rpc_client
+                                                    .get_transaction_with_config(
+                                                        &sig,
+                                                        RpcTransactionConfig {
+                                                            encoding: Some(
+                                                                UiTransactionEncoding::Base64,
+                                                            ),
+                                                            commitment: Some(
+                                                                rpc_client.commitment(),
+                                                            ),
+                                                            max_supported_transaction_version: None,
+                                                        },
+                                                    )
+                                                    .await
+                                                {
+                                                    let data = txn_result
+                                                        .transaction
+                                                        .meta
+                                                        .unwrap()
+                                                        .return_data;
 
                                                     match data {
                                                         solana_transaction_status::option_serializer::OptionSerializer::Some(data) => {
@@ -1068,7 +1197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     break;
                                                 } else {
                                                     error!("Failed to get confirmed transaction... Come on rpc...");
-                                                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                                                    tokio::time::sleep(Duration::from_millis(2000))
+                                                        .await;
                                                 }
                                             }
                                         });
@@ -1081,9 +1211,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                             if old_proof.challenge.eq(&latest_proof.challenge) {
                                                 info!("Proof challenge not updated yet..");
-                                                if let Ok(p) = get_proof(&rpc_client, app_wallet.miner_wallet.pubkey()).await {
-                                                    info!("OLD PROOF CHALLENGE: {}", BASE64_STANDARD.encode(old_proof.challenge));
-                                                    info!("RPC PROOF CHALLENGE: {}", BASE64_STANDARD.encode(p.challenge));
+                                                if let Ok(p) = get_proof(
+                                                    &rpc_client,
+                                                    app_wallet.miner_wallet.pubkey(),
+                                                )
+                                                .await
+                                                {
+                                                    info!(
+                                                        "OLD PROOF CHALLENGE: {}",
+                                                        BASE64_STANDARD.encode(old_proof.challenge)
+                                                    );
+                                                    info!(
+                                                        "RPC PROOF CHALLENGE: {}",
+                                                        BASE64_STANDARD.encode(p.challenge)
+                                                    );
                                                     let mut found_new_proof = false;
                                                     if old_proof.challenge.ne(&p.challenge) {
                                                         found_new_proof = true;
@@ -1094,7 +1235,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         info!("Found new proof from rpc call, not websocket...");
                                                     }
                                                 }
-                                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                                tokio::time::sleep(Duration::from_millis(1000))
+                                                    .await;
                                                 continue;
                                             } else {
                                                 info!("Adding new challenge to db");
@@ -1110,8 +1252,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 {
                                                     error!("Failed to add new challenge to db.");
                                                     info!("Verifying challenge does not already exist.");
-                                                    if let Ok(_) = app_database.get_challenge_by_challenge(new_challenge.challenge.clone()).await {
-                                                        info!("Challenge already exists, continuing");
+                                                    if let Ok(_) = app_database
+                                                        .get_challenge_by_challenge(
+                                                            new_challenge.challenge.clone(),
+                                                        )
+                                                        .await
+                                                    {
+                                                        info!(
+                                                            "Challenge already exists, continuing"
+                                                        );
                                                         break;
                                                     }
 
@@ -1119,7 +1268,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         .await;
                                                 }
                                                 info!("New challenge successfully added to db");
-
 
                                                 // Reset mining data
                                                 // {
@@ -1154,7 +1302,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 // Open submission window
                                                 info!("openning submission window.");
-                                                let mut writer = app_submission_window.write().await;
+                                                let mut writer =
+                                                    app_submission_window.write().await;
                                                 writer.closed = false;
                                                 drop(writer);
 
@@ -1163,7 +1312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
 
                                         break;
-                                    },
+                                    }
                                     Err(e) => {
                                         error!("Failed to send and confirm txn");
                                         error!("Error: {:?}", e);
@@ -1207,7 +1356,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut writer = app_submission_window.write().await;
                         writer.closed = false;
                         drop(writer);
-
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 } else {
@@ -1273,7 +1421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 0.0 // Handle the case where pool_rewards_dec is 0 to avoid division by zero
                             };
-                            
+
                             let message = format!(
                                 "Pool Submitted Difficulty: {}\nPool Earned:  {:.11} ORE\nPool Balance: {:.11}\n----------------------\nActive Miners: {}\n----------------------\nMiner Submitted Difficulty: {}\nMiner Earned: {:.11} ORE\n{:.2}% of total pool reward",
                                 msg.difficulty,
@@ -1284,7 +1432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 earned_rewards_dec,
                                 percentage
                             );
-                            
+
                             let socket_sender = socket_sender.clone();
                             tokio::spawn(async move {
                                 if let Ok(_) = socket_sender
@@ -1356,6 +1504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/pause", post(post_pause))
         .route("/latest-blockhash", get(get_latest_blockhash))
         .route("/pool/authority/pubkey", get(get_pool_authority_pubkey))
+        .route("/miner/authority/pubkey", get(get_miner_authority_pubkey))
         .route("/pool/fee_payer/pubkey", get(get_pool_fee_payer_pubkey))
         .route("/signup", post(post_signup))
         .route("/claim", post(post_claim))
@@ -1367,7 +1516,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/miner/stake", get(get_miner_stake))
         .route("/stake-multiplier", get(get_stake_multiplier))
         // App RR Database routes
-        .route("/last-challenge-submissions", get(get_last_challenge_submissions))
+        .route(
+            "/last-challenge-submissions",
+            get(get_last_challenge_submissions),
+        )
         .route("/miner/rewards", get(get_miner_rewards))
         .route("/miner/submissions", get(get_miner_submissions))
         .route("/challenges", get(get_challenges))
@@ -1409,6 +1561,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap();
 
     Ok(())
+}
+
+async fn get_miner_authority_pubkey() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/text")
+        .body(KEYPAIR.pubkey().to_string())
+        .unwrap()
 }
 
 async fn get_pool_authority_pubkey(
@@ -1561,38 +1721,48 @@ async fn post_signup(
             }
         }
 
-        let serialized_tx = BASE64_STANDARD.decode(body.clone()).unwrap();
-        let tx: Transaction = if let Ok(tx) = bincode::deserialize(&serialized_tx) {
-            tx
-        } else {
-            error!("Failed to deserialize tx");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body("Invalid Tx".to_string())
-                .unwrap();
-        };
+        // let serialized_tx = BASE64_STANDARD.decode(body.clone()).unwrap();
+        // let tx: Transaction = if let Ok(tx) = bincode::deserialize(&serialized_tx) {
+        //     tx
+        // } else {
+        //     error!("Failed to deserialize tx");
+        //     return Response::builder()
+        //         .status(StatusCode::BAD_REQUEST)
+        //         .body("Invalid Tx".to_string())
+        //         .unwrap();
+        // };
 
-        if !tx.is_signed() {
-            error!("Tx missing signer");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body("Invalid Tx".to_string())
-                .unwrap();
-        }
+        // if !tx.is_signed() {
+        //     error!("Tx missing signer");
+        //     return Response::builder()
+        //         .status(StatusCode::BAD_REQUEST)
+        //         .body("Invalid Tx".to_string())
+        //         .unwrap();
+        // }
 
-        let ixs = tx.message.instructions.clone();
+        // let ixs = tx.message.instructions.clone();
 
-        if ixs.len() > 1 {
-            error!("Too many instructions");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body("Invalid Tx".to_string())
-                .unwrap();
-        }
+        // if ixs.len() > 1 {
+        //     error!("Too many instructions");
+        //     return Response::builder()
+        //         .status(StatusCode::BAD_REQUEST)
+        //         .body("Invalid Tx".to_string())
+        //         .unwrap();
+        // }
 
-        let base_ix = system_instruction::transfer(&user_pubkey, &wallet.miner_wallet.pubkey(), 1_000_000);
+        let miner_pubkey = KEYPAIR.pubkey();
+        let base_ix =
+            system_instruction::transfer(&miner_pubkey, &wallet.miner_wallet.pubkey(), 1_000_000);
+        let mut tx = Transaction::new_with_payer(&[base_ix.clone()], Some(&miner_pubkey));
+        let latest_blockhash = rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .unwrap()
+            .0;
+        tx.sign(&[&KEYPAIR], latest_blockhash);
+
         let mut accts = Vec::new();
-        for account_index in ixs[0].accounts.clone() {
+        for account_index in 0..base_ix.accounts.len() {
             accts.push(tx.key(0, account_index.into()));
         }
 
@@ -1604,69 +1774,126 @@ async fn post_signup(
                 .unwrap();
         }
 
-        if ixs[0].data.ne(&base_ix.data) {
-            error!("data missmatch");
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body("Invalid Tx".to_string())
-                .unwrap();
-        } else {
-            info!("Valid signup tx, submitting.");
+        // if ixs[0].data.ne(&base_ix.data) {
+        //     error!("data missmatch");
+        //     return Response::builder()
+        //         .status(StatusCode::BAD_REQUEST)
+        //         .body("Invalid Tx".to_string())
+        //         .unwrap();
+        // } else {
+        //     info!("Valid signup tx, submitting.");
 
-            let result = rpc_client.send_and_confirm_transaction(&tx).await;
+        //     let result = rpc_client.send_and_confirm_transaction(&tx).await;
 
-            match result {
-                Ok(_sig) => {
-                    let res = app_database
-                        .add_new_miner(user_pubkey.to_string(), true)
-                        .await;
-                    let miner = app_database
-                        .get_miner_by_pubkey_str(user_pubkey.to_string())
-                        .await
-                        .unwrap();
+        //     match result {
+        //         Ok(_sig) => {
+        //             let res = app_database
+        //                 .add_new_miner(user_pubkey.to_string(), true)
+        //                 .await;
+        //             let miner = app_database
+        //                 .get_miner_by_pubkey_str(user_pubkey.to_string())
+        //                 .await
+        //                 .unwrap();
 
-                    let wallet_pubkey = wallet.miner_wallet.pubkey();
-                    let pool = app_database
-                        .get_pool_by_authority_pubkey(wallet_pubkey.to_string())
-                        .await
-                        .unwrap();
+        //             let wallet_pubkey = wallet.miner_wallet.pubkey();
+        //             let pool = app_database
+        //                 .get_pool_by_authority_pubkey(wallet_pubkey.to_string())
+        //                 .await
+        //                 .unwrap();
 
-                    if res.is_ok() {
-                        let new_reward = InsertReward {
-                            miner_id: miner.id,
-                            pool_id: pool.id,
-                        };
-                        let result = app_database.add_new_reward(new_reward).await;
+        //             if res.is_ok() {
+        //                 let new_reward = InsertReward {
+        //                     miner_id: miner.id,
+        //                     pool_id: pool.id,
+        //                 };
+        //                 let result = app_database.add_new_reward(new_reward).await;
 
-                        if result.is_ok() {
-                            return Response::builder()
-                                .status(StatusCode::OK)
-                                .header("Content-Type", "text/text")
-                                .body("SUCCESS".to_string())
-                                .unwrap();
-                        } else {
-                            error!("Failed to add miner rewards tracker to database");
-                            return Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body("Failed to add miner rewards tracker to database".to_string())
-                                .unwrap();
-                        }
+        //                 if result.is_ok() {
+        //                     return Response::builder()
+        //                         .status(StatusCode::OK)
+        //                         .header("Content-Type", "text/text")
+        //                         .body("SUCCESS".to_string())
+        //                         .unwrap();
+        //                 } else {
+        //                     error!("Failed to add miner rewards tracker to database");
+        //                     return Response::builder()
+        //                         .status(StatusCode::INTERNAL_SERVER_ERROR)
+        //                         .body("Failed to add miner rewards tracker to database".to_string())
+        //                         .unwrap();
+        //                 }
+        //             } else {
+        //                 error!("Failed to add miner to database");
+        //                 return Response::builder()
+        //                     .status(StatusCode::INTERNAL_SERVER_ERROR)
+        //                     .body("Failed to add user to database".to_string())
+        //                     .unwrap();
+        //             }
+        //         }
+        //         Err(e) => {
+        //             error!("{} signup transaction failed...", user_pubkey.to_string());
+        //             error!("Signup Tx Error: {:?}", e);
+        //             return Response::builder()
+        //                 .status(StatusCode::INTERNAL_SERVER_ERROR)
+        //                 .body("Failed to send tx".to_string())
+        //                 .unwrap();
+        //         }
+        //     }
+        // }
+
+        info!("Valid signup tx, submitting.");
+
+        let result = rpc_client.send_and_confirm_transaction(&tx).await;
+        match result {
+            Ok(_sig) => {
+                let res = app_database
+                    .add_new_miner(user_pubkey.to_string(), true)
+                    .await;
+                let miner = app_database
+                    .get_miner_by_pubkey_str(user_pubkey.to_string())
+                    .await
+                    .unwrap();
+
+                let wallet_pubkey = wallet.miner_wallet.pubkey();
+                let pool = app_database
+                    .get_pool_by_authority_pubkey(wallet_pubkey.to_string())
+                    .await
+                    .unwrap();
+
+                if res.is_ok() {
+                    let new_reward = InsertReward {
+                        miner_id: miner.id,
+                        pool_id: pool.id,
+                    };
+                    let result = app_database.add_new_reward(new_reward).await;
+
+                    if result.is_ok() {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "text/text")
+                            .body("SUCCESS".to_string())
+                            .unwrap();
                     } else {
-                        error!("Failed to add miner to database");
+                        error!("Failed to add miner rewards tracker to database");
                         return Response::builder()
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body("Failed to add user to database".to_string())
+                            .body("Failed to add miner rewards tracker to database".to_string())
                             .unwrap();
                     }
-                },
-                Err(e) => {
-                    error!("{} signup transaction failed...", user_pubkey.to_string());
-                    error!("Signup Tx Error: {:?}", e);
+                } else {
+                    error!("Failed to add miner to database");
                     return Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body("Failed to send tx".to_string())
+                        .body("Failed to add user to database".to_string())
                         .unwrap();
                 }
+            }
+            Err(e) => {
+                error!("{} signup transaction failed...", user_pubkey.to_string());
+                error!("Signup Tx Error: {:?}", e);
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body("Failed to send tx".to_string())
+                    .unwrap();
             }
         }
     } else {
@@ -1703,7 +1930,10 @@ async fn get_miner_rewards(
                     .unwrap();
             }
             Err(_) => {
-                error!("get_miner_rewards: failed to get rewards balance from db for {}", user_pubkey.to_string());
+                error!(
+                    "get_miner_rewards: failed to get rewards balance from db for {}",
+                    user_pubkey.to_string()
+                );
                 return Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body("Failed to get balance".to_string())
@@ -1723,17 +1953,11 @@ async fn get_last_challenge_submissions(
     Extension(app_config): Extension<Arc<Config>>,
 ) -> Result<Json<Vec<SubmissionWithPubkey>>, String> {
     if app_config.stats_enabled {
-        let res = app_rr_database
-            .get_last_challenge_submissions()
-            .await;
+        let res = app_rr_database.get_last_challenge_submissions().await;
 
         match res {
-            Ok(submissions) => {
-                Ok(Json(submissions))
-            }
-            Err(_) => {
-                Err("Failed to get submissions for miner".to_string())
-            }
+            Ok(submissions) => Ok(Json(submissions)),
+            Err(_) => Err("Failed to get submissions for miner".to_string()),
         }
     } else {
         return Err("Stats not enabled for this server.".to_string());
@@ -1757,12 +1981,8 @@ async fn get_miner_submissions(
                 .await;
 
             match res {
-                Ok(submissions) => {
-                    Ok(Json(submissions))
-                }
-                Err(_) => {
-                    Err("Failed to get submissions for miner".to_string())
-                }
+                Ok(submissions) => Ok(Json(submissions)),
+                Err(_) => Err("Failed to get submissions for miner".to_string()),
             }
         } else {
             Err("Invalid public key".to_string())
@@ -1806,7 +2026,9 @@ async fn get_miner_stake(
     Extension(wallet): Extension<Arc<WalletExtension>>,
 ) -> impl IntoResponse {
     if let Ok(user_pubkey) = Pubkey::from_str(&query_params.pubkey) {
-        if let Ok(account) = get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey()).await
+        if let Ok(account) =
+            get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey())
+                .await
         {
             let decimals = 10f64.powf(ORE_TOKEN_DECIMALS as f64);
             let dec_amount = (account.amount as f64).div(decimals);
@@ -1832,8 +2054,7 @@ async fn get_stake_multiplier(
             return Err("Stats not enabled for this server.".to_string());
         };
 
-        if let Ok(config) = get_config(&rpc_client).await
-        {
+        if let Ok(config) = get_config(&rpc_client).await {
             let multiplier = 1.0 + (proof.balance as f64 / config.top_balance as f64).min(1.0f64);
             return Ok(Json(multiplier));
         } else {
@@ -1914,7 +2135,7 @@ async fn post_claim(
                     .expect("Time went backwards")
                     .as_secs() as i64;
                 let time_difference = now - last_claim_ts;
-                if time_difference  <= 1800 {
+                if time_difference <= 1800 {
                     return Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS)
                         .body(time_difference.to_string())
@@ -1978,8 +2199,15 @@ async fn post_stake(
                 .unwrap();
         }
 
-        if let Err(_) = get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey()).await {
-            let init_ix = ore_miner_delegation::instruction::init_delegate_stake(user_pubkey, wallet.miner_wallet.pubkey(), wallet.fee_wallet.pubkey());
+        if let Err(_) =
+            get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey())
+                .await
+        {
+            let init_ix = ore_miner_delegation::instruction::init_delegate_stake(
+                user_pubkey,
+                wallet.miner_wallet.pubkey(),
+                wallet.fee_wallet.pubkey(),
+            );
 
             let prio_fee: u32 = 20_000;
 
@@ -1996,14 +2224,17 @@ async fn post_stake(
 
                 tx.sign(&[wallet.fee_wallet.as_ref()], hash);
 
-                let rpc_config =  RpcSendTransactionConfig {
+                let rpc_config = RpcSendTransactionConfig {
                     preflight_commitment: Some(rpc_client.commitment().commitment),
                     ..RpcSendTransactionConfig::default()
                 };
 
                 let signature;
                 loop {
-                    if let Ok(sig) = rpc_client.send_transaction_with_config(&tx, rpc_config).await {
+                    if let Ok(sig) = rpc_client
+                        .send_transaction_with_config(&tx, rpc_config)
+                        .await
+                    {
                         signature = sig;
                         break;
                     } else {
@@ -2020,7 +2251,9 @@ async fn post_stake(
                     if let Ok(response) = results {
                         let statuses = response.value;
                         if let Some(status) = &statuses[0] {
-                            if status.confirmation_status() == TransactionConfirmationStatus::Confirmed {
+                            if status.confirmation_status()
+                                == TransactionConfirmationStatus::Confirmed
+                            {
                                 if status.err.is_some() {
                                     let e_str = format!("Transaction Failed: {:?}", status.err);
                                     break Err(e_str);
@@ -2034,7 +2267,10 @@ async fn post_stake(
 
                 match result {
                     Ok(sig) => {
-                        info!("Successfully created delegate stake account for: {}", user_pubkey.to_string());
+                        info!(
+                            "Successfully created delegate stake account for: {}",
+                            user_pubkey.to_string()
+                        );
                     }
                     Err(e) => {
                         error!("ERROR: {:?}", e);
@@ -2042,17 +2278,18 @@ async fn post_stake(
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
                             .body("Failed to init delegate stake account.".to_string())
                             .unwrap();
-
                     }
                 }
-
             } else {
                 error!("Failed to confirm transaction for init delegate stake.");
             }
         }
 
-
-        let base_ix = ore_miner_delegation::instruction::delegate_stake(user_pubkey, wallet.miner_wallet.pubkey(), query_params.amount);
+        let base_ix = ore_miner_delegation::instruction::delegate_stake(
+            user_pubkey,
+            wallet.miner_wallet.pubkey(),
+            query_params.amount,
+        );
         let mut accts = Vec::new();
         for account_index in ixs[0].accounts.clone() {
             accts.push(tx.key(0, account_index.into()));
@@ -2088,13 +2325,19 @@ async fn post_stake(
 
             match result {
                 Ok(sig) => {
-                    let amount_dec = query_params.amount as f64 / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
-                    info!("Miner {} successfully delegated stake of {}.\nSig: {}", user_pubkey.to_string(), amount_dec, sig.to_string());
+                    let amount_dec =
+                        query_params.amount as f64 / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
+                    info!(
+                        "Miner {} successfully delegated stake of {}.\nSig: {}",
+                        user_pubkey.to_string(),
+                        amount_dec,
+                        sig.to_string()
+                    );
                     return Response::builder()
                         .status(StatusCode::OK)
                         .body("SUCCESS".to_string())
                         .unwrap();
-                },
+                }
                 Err(e) => {
                     error!("{} stake transaction failed...", user_pubkey.to_string());
                     error!("Stake Tx Error: {:?}", e);
@@ -2148,8 +2391,14 @@ async fn post_unstake(
                 .unwrap();
         }
 
-        if let Err(_) = get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey()).await {
-            error!("Cannot unstake, no delegate stake account is created for {}", user_pubkey.to_string());
+        if let Err(_) =
+            get_delegated_stake_account(&rpc_client, user_pubkey, wallet.miner_wallet.pubkey())
+                .await
+        {
+            error!(
+                "Cannot unstake, no delegate stake account is created for {}",
+                user_pubkey.to_string()
+            );
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body("No delegate stake account exists".to_string())
@@ -2158,7 +2407,12 @@ async fn post_unstake(
 
         let staker_ata = get_associated_token_address(&user_pubkey, &ore_api::consts::MINT_ADDRESS);
 
-        let base_ix = ore_miner_delegation::instruction::undelegate_stake(user_pubkey, wallet.miner_wallet.pubkey(), staker_ata, query_params.amount);
+        let base_ix = ore_miner_delegation::instruction::undelegate_stake(
+            user_pubkey,
+            wallet.miner_wallet.pubkey(),
+            staker_ata,
+            query_params.amount,
+        );
         let mut accts = Vec::new();
         for account_index in ixs[0].accounts.clone() {
             accts.push(tx.key(0, account_index.into()));
@@ -2194,13 +2448,19 @@ async fn post_unstake(
 
             match result {
                 Ok(sig) => {
-                    let amount_dec = query_params.amount as f64 / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
-                    info!("Miner {} successfully undelegated stake of {}.\nSig: {}", user_pubkey.to_string(), amount_dec, sig.to_string());
+                    let amount_dec =
+                        query_params.amount as f64 / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
+                    info!(
+                        "Miner {} successfully undelegated stake of {}.\nSig: {}",
+                        user_pubkey.to_string(),
+                        amount_dec,
+                        sig.to_string()
+                    );
                     return Response::builder()
                         .status(StatusCode::OK)
                         .body("SUCCESS".to_string())
                         .unwrap();
-                },
+                }
                 Err(e) => {
                     error!("{} unstake transaction failed...", user_pubkey.to_string());
                     error!("Unstake Tx Error: {:?}", e);
@@ -2223,6 +2483,7 @@ async fn post_unstake(
 #[derive(Deserialize)]
 struct WsQueryParams {
     timestamp: u64,
+    pubkey: String,
 }
 
 async fn ws_handler(
@@ -2250,82 +2511,87 @@ async fn ws_handler(
         return Err((StatusCode::UNAUTHORIZED, "Timestamp too old."));
     }
 
-    // verify client
-    if let Ok(user_pubkey) = Pubkey::from_str(pubkey) {
-        {
-            let mut already_connected = false;
-            for (_, app_client_connection) in app_state.read().await.sockets.iter() {
-                if user_pubkey == app_client_connection.pubkey {
-                    already_connected = true;
-                    break;
+    if let Ok(auth_pubkey) = Pubkey::from_str(&query_params.pubkey) {
+        // verify client
+        if let Ok(user_pubkey) = Pubkey::from_str(pubkey) {
+            {
+                let mut already_connected = false;
+                for (_, app_client_connection) in app_state.read().await.sockets.iter() {
+                    if user_pubkey == app_client_connection.pubkey {
+                        already_connected = true;
+                        break;
+                    }
+                }
+                // if already_connected {
+                //     return Err((
+                //         StatusCode::TOO_MANY_REQUESTS,
+                //         "A client is already connected with that wallet",
+                //     ));
+                // }
+            };
+
+            let db_miner = app_database
+                .get_miner_by_pubkey_str(user_pubkey.to_string())
+                .await;
+
+            let miner;
+            match db_miner {
+                Ok(db_miner) => {
+                    miner = db_miner;
+                }
+                Err(AppDatabaseError::QueryFailed) => {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "pubkey is not authorized to mine. please sign up.",
+                    ));
+                }
+                Err(AppDatabaseError::InteractionFailed) => {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "pubkey is not authorized to mine. please sign up.",
+                    ));
+                }
+                Err(AppDatabaseError::FailedToGetConnectionFromPool) => {
+                    error!("Failed to get database pool connection.");
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"));
+                }
+                Err(_) => {
+                    error!("DB Error: Catch all.");
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"));
                 }
             }
-            if already_connected {
-                return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "A client is already connected with that wallet",
-                ));
-            }
-        };
 
-        let db_miner = app_database
-            .get_miner_by_pubkey_str(pubkey.to_string())
-            .await;
+            if !miner.enabled {
+                return Err((StatusCode::UNAUTHORIZED, "pubkey is not authorized to mine"));
+            }
 
-        let miner;
-        match db_miner {
-            Ok(db_miner) => {
-                miner = db_miner;
-            }
-            Err(AppDatabaseError::QueryFailed) => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "pubkey is not authorized to mine. please sign up.",
-                ));
-            }
-            Err(AppDatabaseError::InteractionFailed) => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "pubkey is not authorized to mine. please sign up.",
-                ));
-            }
-            Err(AppDatabaseError::FailedToGetConnectionFromPool) => {
-                error!("Failed to get database pool connection.");
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"));
-            }
-            Err(_) => {
-                error!("DB Error: Catch all.");
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"));
-            }
-        }
+            if let Ok(signature) = Signature::from_str(signed_msg) {
+                let ts_msg = msg_timestamp.to_le_bytes();
 
-        if !miner.enabled {
-            return Err((StatusCode::UNAUTHORIZED, "pubkey is not authorized to mine"));
-        }
-
-        if let Ok(signature) = Signature::from_str(signed_msg) {
-            let ts_msg = msg_timestamp.to_le_bytes();
-
-            if signature.verify(&user_pubkey.to_bytes(), &ts_msg) {
-                info!("Client: {addr} connected with pubkey {pubkey}.");
-                return Ok(ws.on_upgrade(move |socket| {
-                    handle_socket(
-                        socket,
-                        addr,
-                        user_pubkey,
-                        miner.id,
-                        app_state,
-                        client_channel,
-                    )
-                }));
+                if signature.verify(&auth_pubkey.to_bytes(), &ts_msg) {
+                    info!("Client: {addr} connected with pubkey {pubkey}.");
+                    return Ok(ws.on_upgrade(move |socket| {
+                        handle_socket(
+                            socket,
+                            addr,
+                            user_pubkey,
+                            auth_pubkey,
+                            miner.id,
+                            app_state,
+                            client_channel,
+                        )
+                    }));
+                } else {
+                    return Err((StatusCode::UNAUTHORIZED, "Sig verification failed"));
+                }
             } else {
-                return Err((StatusCode::UNAUTHORIZED, "Sig verification failed"));
+                return Err((StatusCode::UNAUTHORIZED, "Invalid signature"));
             }
         } else {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid signature"));
+            return Err((StatusCode::UNAUTHORIZED, "Invalid pubkey"));
         }
     } else {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid pubkey"));
+        return Err((StatusCode::UNAUTHORIZED, "Invalid auth pubkey"));
     }
 }
 
@@ -2333,6 +2599,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     who: SocketAddr,
     who_pubkey: Pubkey,
+    auth_pubkey: Pubkey,
     who_miner_id: i32,
     rw_app_state: Arc<RwLock<AppState>>,
     client_channel: UnboundedSender<ClientMessage>,
@@ -2426,16 +2693,24 @@ fn process_message(
 
                     b_index += 32;
 
+                    let mut auth_pubkey = [0u8; 32];
+                    for i in 0..32 {
+                        auth_pubkey[i] = d[i + b_index];
+                    }
+
+                    b_index += 32;
+
                     let signature_bytes = d[b_index..].to_vec();
                     if let Ok(sig_str) = String::from_utf8(signature_bytes.clone()) {
                         if let Ok(sig) = Signature::from_str(&sig_str) {
                             let pubkey = Pubkey::new_from_array(pubkey);
+                            let auth_pubkey = Pubkey::new_from_array(auth_pubkey);
 
                             let mut hash_nonce_message = [0; 24];
                             hash_nonce_message[0..16].copy_from_slice(&solution_bytes);
                             hash_nonce_message[16..24].copy_from_slice(&nonce);
 
-                            if sig.verify(&pubkey.to_bytes(), &hash_nonce_message) {
+                            if sig.verify(&auth_pubkey.to_bytes(), &hash_nonce_message) {
                                 let solution = Solution::new(solution_bytes, nonce);
 
                                 let msg = ClientMessage::BestSolution(who, solution, pubkey);
@@ -2537,10 +2812,7 @@ async fn proof_tracking_system(ws_url: String, wallet: Arc<Keypair>, proof: Arc<
     }
 }
 
-async fn pong_tracking_system(
-    app_pongs: Arc<RwLock<LastPong>>,
-    app_state: Arc<RwLock<AppState>>,
-) {
+async fn pong_tracking_system(app_pongs: Arc<RwLock<LastPong>>, app_state: Arc<RwLock<AppState>>) {
     loop {
         let reader = app_pongs.read().await;
         let pongs = reader.pongs.clone();
@@ -2615,7 +2887,12 @@ async fn client_message_handler_system(
                         let reader = app_state.read().await;
                         if let Some(app_client_socket) = reader.sockets.get(&addr) {
                             let msg = format!("Late submission. Please make sure your hash time is under 60 seconds.");
-                            let _ = app_client_socket.socket.lock().await.send(Message::Text(msg)).await;
+                            let _ = app_client_socket
+                                .socket
+                                .lock()
+                                .await
+                                .send(Message::Text(msg))
+                                .await;
                         } else {
                             error!("Failed to get client socket for addr: {}", addr);
                             return;

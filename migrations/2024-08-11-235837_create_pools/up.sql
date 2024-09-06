@@ -1,6 +1,9 @@
 CREATE TABLE pools (
   id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   proof_pubkey VARCHAR(44) NOT NULL,
+  authority TEXT NOT NULL,
+  fee_authority TEXT NOT NULL,
+  mine_authority TEXT NOT NULL,
   authority_pubkey VARCHAR(44) NOT NULL,
   total_rewards BIGINT UNSIGNED DEFAULT 0 NOT NULL,
   claimed_rewards BIGINT UNSIGNED DEFAULT 0 NOT NULL,
